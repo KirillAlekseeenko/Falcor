@@ -1,5 +1,5 @@
 /***************************************************************************
- # Copyright (c) 2015-24, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2015-23, NVIDIA CORPORATION. All rights reserved.
  #
  # Redistribution and use in source and binary forms, with or without
  # modification, are permitted provided that the following conditions
@@ -25,39 +25,44 @@
  # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  **************************************************************************/
-import Scene.Raster;
-import Utils.Sampling.TinyUniformSampleGenerator;
-import Rendering.Lights.LightHelpers;
+#pragma once
+#include "Falcor.h"
+#include "Core/SampleApp.h"
+#include "Core/Pass/RasterPass.h"
 
-VSOut vsMain(VSIn vIn)
+using namespace Falcor;
+
+class PathTracingDemo : public SampleApp
 {
-    return defaultVS(vIn);
-}
+public:
+    PathTracingDemo(const SampleAppConfig& config);
+    ~PathTracingDemo();
 
-float4 psMain(VSOut vsOut, uint triangleIndex: SV_PrimitiveID) : SV_TARGET
-{
-    let lod = ImplicitLodTextureSampler();
-    if (alphaTest(vsOut, triangleIndex, lod))
-        discard;
+    void loadScene(const std::string& scenePath, Fbo* displayFbo);
+    void onLoad(RenderContext* pRenderContext) override;
+    void onShutdown() override;
+    void onResize(uint32_t width, uint32_t height) override;
+    void onFrameRender(RenderContext* pRenderContext, const ref<Fbo>& pTargetFbo) override;
+    void onGuiRender(Gui* pGui) override;
+    bool onKeyEvent(const KeyboardEvent& keyEvent) override;
+    bool onMouseEvent(const MouseEvent& mouseEvent) override;
+    void onHotReload(HotReloadFlags reloaded) override;
 
-    float3 viewDir = normalize(gScene.camera.getPosition() - vsOut.posW);
-    ShadingData sd = prepareShadingData(vsOut, triangleIndex, viewDir);
+private:
+    float3 getFirstDirectionalLightDir(int& dirLightIndex) const;
 
-    // Create material instance.
-    let mi = gScene.materials.getMaterialInstance(sd, lod);
+private:
+    ref<Scene> mpScene;
+    ref<Camera> mpCamera;
 
-    float3 color = mi.getProperties(sd).emission;
+    ref<RasterPass> mpRasterPass;
 
-    uint3 launchIndex = uint3(0, 0, 0);//DispatchRaysIndex();
-    TinyUniformSampleGenerator sg = TinyUniformSampleGenerator(launchIndex.xy, 0);
+    // Shadow pass
+    ref<RasterPass> mpShadowPass; // depth-only
+    ref<Texture> mpShadowMap;     // 2-D depth texture
+    ref<Fbo> mpShadowFbo;         // FBO with depth, no color
+    ref<Sampler> mpShadowSampler; // comparison sampler
 
-    // Direct lighting from analytic light sources
-    for (int i = 0; i < gScene.getLightCount(); i++)
-    {
-        AnalyticLightSample ls;
-        evalLightApproximate(sd.posW, gScene.getLight(i), ls);
-        color += mi.eval(sd, ls.dir, sg) * ls.Li;
-    }
-
-    return float4(color, 1.f);
-}
+    float4x4 mLightVP;                // light view-projection (updated each frame)
+    const uint32_t kShadowRes = 4096;
+};

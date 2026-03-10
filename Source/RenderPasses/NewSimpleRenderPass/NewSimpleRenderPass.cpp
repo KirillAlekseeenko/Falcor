@@ -1,5 +1,5 @@
 /***************************************************************************
- # Copyright (c) 2015-24, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2015-23, NVIDIA CORPORATION. All rights reserved.
  #
  # Redistribution and use in source and binary forms, with or without
  # modification, are permitted provided that the following conditions
@@ -25,39 +25,48 @@
  # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  **************************************************************************/
-import Scene.Raster;
-import Utils.Sampling.TinyUniformSampleGenerator;
-import Rendering.Lights.LightHelpers;
+#include "NewSimpleRenderPass.h"
 
-VSOut vsMain(VSIn vIn)
+extern "C" FALCOR_API_EXPORT void registerPlugin(Falcor::PluginRegistry& registry)
 {
-    return defaultVS(vIn);
+    registry.registerClass<RenderPass, NewSimpleRenderPass>();
 }
 
-float4 psMain(VSOut vsOut, uint triangleIndex: SV_PrimitiveID) : SV_TARGET
+NewSimpleRenderPass::NewSimpleRenderPass(ref<Device> pDevice, const Properties& props) : RenderPass(pDevice) {}
+
+Properties NewSimpleRenderPass::getProperties() const
 {
-    let lod = ImplicitLodTextureSampler();
-    if (alphaTest(vsOut, triangleIndex, lod))
-        discard;
+    return {};
+}
 
-    float3 viewDir = normalize(gScene.camera.getPosition() - vsOut.posW);
-    ShadingData sd = prepareShadingData(vsOut, triangleIndex, viewDir);
+RenderPassReflection NewSimpleRenderPass::reflect(const CompileData& compileData)
+{
+    // Define the required resources here
+    RenderPassReflection reflector;
+    reflector.addInput("input", "the source texture");
+    reflector.addOutput("output", "the destination texture");
+    // reflector.addOutput("dst");
+    // reflector.addInput("src");
+    return reflector;
+}
 
-    // Create material instance.
-    let mi = gScene.materials.getMaterialInstance(sd, lod);
+void NewSimpleRenderPass::execute(RenderContext* pRenderContext, const RenderData& renderData)
+{
+    // renderData holds the requested resources
+    // auto& pTexture = renderData.getTexture("src");
 
-    float3 color = mi.getProperties(sd).emission;
+    const auto& pSrcTex = renderData.getTexture("input");
+    const auto& pDstTex = renderData.getTexture("output");
 
-    uint3 launchIndex = uint3(0, 0, 0);//DispatchRaysIndex();
-    TinyUniformSampleGenerator sg = TinyUniformSampleGenerator(launchIndex.xy, 0);
-
-    // Direct lighting from analytic light sources
-    for (int i = 0; i < gScene.getLightCount(); i++)
+    if (pSrcTex && pDstTex)
     {
-        AnalyticLightSample ls;
-        evalLightApproximate(sd.posW, gScene.getLight(i), ls);
-        color += mi.eval(sd, ls.dir, sg) * ls.Li;
+        pRenderContext->blit(pSrcTex->getSRV(), pDstTex->getRTV());
     }
-
-    return float4(color, 1.f);
+    else
+    {
+        logWarning("ExampleBlitPass::execute() - missing an input or output resource");
+    }
 }
+
+void NewSimpleRenderPass::renderUI(Gui::Widgets& widget) {}
+
