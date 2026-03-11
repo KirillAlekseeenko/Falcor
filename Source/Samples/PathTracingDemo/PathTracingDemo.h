@@ -29,6 +29,7 @@
 #include "Falcor.h"
 #include "Core/SampleApp.h"
 #include "Core/Pass/RasterPass.h"
+#include "RenderShadowMap.h"
 
 using namespace Falcor;
 
@@ -52,17 +53,12 @@ private:
     float3 getFirstDirectionalLightDir(int& dirLightIndex) const;
 
 private:
-    ref<Scene> mpScene;
+    ref<Scene>  mpScene;
     ref<Camera> mpCamera;
 
     ref<RasterPass> mpRasterPass;
 
-    // Shadow pass
-    ref<RasterPass> mpShadowPass; // depth-only
-    ref<Texture> mpShadowMap;     // 2-D depth texture
-    ref<Fbo> mpShadowFbo;         // FBO with depth, no color
-    ref<Sampler> mpShadowSampler; // comparison sampler
-
-    float4x4 mLightVP;                // light view-projection (updated each frame)
-    const uint32_t kShadowRes = 4096;
+    std::unique_ptr<RenderShadowMap> mpShadowMapRenderer;
+    ref<Sampler>                     mpShadowSampler;     ///< Comparison sampler for PCF
+    bool                             mShadowsEnabled = true;
 };

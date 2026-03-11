@@ -48,54 +48,42 @@ PathTracingDemo::~PathTracingDemo()
 
 void PathTracingDemo::loadScene(const std::string& scenePath, Fbo* displayFbo)
 {
-    mpScene = Scene::create(getDevice(), scenePath);
+    mpScene  = Scene::create(getDevice(), scenePath);
     mpCamera = mpScene->getCamera();
 
     // Update the controllers
     float radius = mpScene->getSceneBounds().radius();
     mpScene->setCameraSpeed(radius * 0.25f);
-    float nearZ = std::max(0.1f, radius / 750.0f);
-    float farZ = radius * 10;
+    float nearZ = 0.1f; // std::max(0.1f, radius / 750.0f);
+    float farZ  = radius * 2;
     mpCamera->setDepthRange(nearZ, farZ);
     mpCamera->setAspectRatio((float)displayFbo->getWidth() / (float)displayFbo->getHeight());
 
     // Get shader modules and type conformances for types used by the scene.
     // These need to be set on the program in order to use Falcor's material system.
-    auto shaderModules = mpScene->getShaderModules();
+    auto shaderModules    = mpScene->getShaderModules();
     auto typeConformances = mpScene->getTypeConformances();
+    auto defines          = mpScene->getSceneDefines();
 
-    // Get scene defines. These need to be set on any program using the scene.
-    auto defines = mpScene->getSceneDefines();
-
-    // Create raster pass.
-    // This utility wraps the creation of the program and vars, and sets the necessary scene defines.
+    // ---- Lighting raster pass -------------------------------------------
     ProgramDesc rasterProgDesc;
     rasterProgDesc.addShaderModules(shaderModules);
-    rasterProgDesc.setCompilerFlags(SlangCompilerFlags::GenerateDebugInfo); // generate PDB/Spir-V debug info
-    rasterProgDesc.addShaderLibrary("Samples/PathTracingDemo/SimpleRasterPass.3d.slang").vsEntry("vsMain").psEntry("psMain");
+    rasterProgDesc.setCompilerFlags(SlangCompilerFlags::GenerateDebugInfo);
+    rasterProgDesc.addShaderLibrary("Samples/PathTracingDemo/SimpleRasterPass.3d.slang")
+        .vsEntry("vsMain")
+        .psEntry("psMain");
     rasterProgDesc.addTypeConformances(typeConformances);
 
     mpRasterPass = RasterPass::create(getDevice(), rasterProgDesc, defines);
 
-    // ------------- depth texture + FBO ------------
-    Fbo::Desc fboDesc;
-    fboDesc.setDepthStencilTarget(ResourceFormat::D32Float);
-    mpShadowFbo = Fbo::create2D(getDevice(), kShadowRes, kShadowRes, fboDesc);
-    mpShadowMap = mpShadowFbo->getDepthStencilTexture();
+    // ---- Cascaded shadow map --------------------------------------------
+    mpShadowMapRenderer = std::make_unique<RenderShadowMap>(getDevice(), mpScene);
 
-    // ------------- depth-only RasterPass ----------
-    ProgramDesc shadowPassDesc;
-    shadowPassDesc.addShaderModules(shaderModules);
-    shadowPassDesc.addShaderLibrary("Samples/PathTracingDemo/ShadowPass.3d.slang").vsEntry("vsMain").psEntry("psMain"); // empty pixel shader
-    shadowPassDesc.addTypeConformances(typeConformances);
-
-    mpShadowPass = RasterPass::create(getDevice(), shadowPassDesc, defines);
-
-    // ------------- PCF comparison sampler --------
+    // ---- PCF comparison sampler -----------------------------------------
     Sampler::Desc sDesc;
     sDesc.setFilterMode(TextureFilteringMode::Linear, TextureFilteringMode::Linear, TextureFilteringMode::Point)
-        .setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp)
-        .setComparisonFunc(ComparisonFunc::LessEqual);
+         .setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp)
+         .setComparisonFunc(ComparisonFunc::LessEqual);
     mpShadowSampler = getDevice()->createSampler(sDesc);
 }
 
@@ -106,14 +94,12 @@ void PathTracingDemo::onLoad(RenderContext* pRenderContext)
         FALCOR_THROW("Device does not support raytracing!");
     }
 
-    const std::string kBistroScenePath = "Bistro_v5_2/BistroExterior.pyscene"; // "Arcade/Arcade.pyscene"
-    // create implementation for the method loadScene
+    const std::string kBistroScenePath = "Bistro_v5_2/BistroExterior.pyscene";
     loadScene(kBistroScenePath, getTargetFbo().get());
 }
 
 void PathTracingDemo::onShutdown()
 {
-    // in DXR sample there is no need to release resources here, as the SampleApp will probably take care of it.
     SampleApp::onShutdown();
 }
 
@@ -121,31 +107,12 @@ void PathTracingDemo::onResize(uint32_t width, uint32_t height)
 {
     SampleApp::onResize(width, height);
 
-    // Resize the scene camera.
     if (mpCamera)
-    {
         mpCamera->setAspectRatio((float)width / (float)height);
-    }
 
-    // Resize the raster pass FBO.
     if (mpRasterPass)
-    {
         mpRasterPass->getState()->setFbo(getTargetFbo());
-    }
 }
-
-static float4x4 computeDirLightVP(const AABB& box, float3 dir)
-{
-    dir = normalize(dir);
-    float3 up = abs(dir.y) > 0.99f ? float3(0, 0, 1) : float3(0, 1, 0);
-    float3 pos = box.center() - dir * box.radius() * 2.f;
-
-    float4x4 view = math::matrixFromLookAt(pos, box.center(), up); 
-    float r = box.radius();
-    float4x4 proj = math::ortho(-r, r, -r, r, 0.1f, r * 4.f);
-    return math::mul(proj, view);
-}
-
 
 float3 PathTracingDemo::getFirstDirectionalLightDir(int& dirLightIndex) const
 {
@@ -157,8 +124,6 @@ float3 PathTracingDemo::getFirstDirectionalLightDir(int& dirLightIndex) const
         return float3(0, 0, 0);
     }
 
-    // If the scene has a directional light, return its direction.
-    // Otherwise, compute a default light direction.
     for (uint32_t i = 0; i < mpScene->getLightCount(); ++i)
     {
         const auto& pLight = mpScene->getLight(i);
@@ -170,7 +135,6 @@ float3 PathTracingDemo::getFirstDirectionalLightDir(int& dirLightIndex) const
         }
     }
 
-    // Default direction if no directional light is found
     return float3(-0.6f, -1.0f, 0.4f);
 }
 
@@ -182,19 +146,15 @@ void PathTracingDemo::onFrameRender(RenderContext* pRenderContext, const ref<Fbo
         return;
     }
 
-    // 1.  compute/update the light matrix once per frame
+    // 1. Locate the directional light
     int dirLightIndex = -1;
-    mLightVP = computeDirLightVP(mpScene->getSceneBounds(), getFirstDirectionalLightDir(dirLightIndex));
+    float3 lightDir = getFirstDirectionalLightDir(dirLightIndex);
 
-    // 2.  ---------- depth pass ----------
-    pRenderContext->clearFbo(mpShadowFbo.get(), float4(0), 1.f, 0, FboAttachmentType::Depth);
-    mpShadowPass->getState()->setFbo(mpShadowFbo);
+    // 2. Render all cascade shadow maps
+    if (mShadowsEnabled)
+        mpShadowMapRenderer->renderCascades(pRenderContext, lightDir);
 
-    auto shadowPassVar = mpShadowPass->getVars()->getRootVar();
-    shadowPassVar["PerFrame"]["gLightVP"] = mLightVP; // uniform used in vsMain
-
-    mpScene->rasterize(pRenderContext, mpShadowPass->getState().get(), mpShadowPass->getVars().get());
-
+    // 3. Clear target and tick the scene
     const float4 clearColor(0.38f, 0.52f, 0.10f, 1);
     pRenderContext->clearFbo(pTargetFbo.get(), clearColor, 1.0f, 0, FboAttachmentType::All);
 
@@ -204,23 +164,28 @@ void PathTracingDemo::onFrameRender(RenderContext* pRenderContext, const ref<Fbo
     if (is_set(updates, IScene::UpdateFlags::RecompileNeeded))
         FALCOR_THROW("This sample does not support scene changes that require shader recompilation.");
 
-    mpRasterPass->getVars()->setSampler("gShadowSampler", mpShadowSampler);
+    // 4. Bind shadow map array and cascade data to the lighting pass
+    const auto& pReflection = mpRasterPass->getProgram()->getReflector()->getDefaultParameterBlock();
+    auto shadowMapLoc    = pReflection->getResourceBinding("gShadowDepth");
+    auto shadowSamplerLoc = pReflection->getResourceBinding("gShadowSampler");
 
-    const auto& pRasterPassDefaultBlockReflection = mpRasterPass->getProgram()->getReflector()->getDefaultParameterBlock();
-    auto shadowMapBindLocation = pRasterPassDefaultBlockReflection->getResourceBinding("gShadowDepth");
-    auto shadowMapSamplerBindLocation = pRasterPassDefaultBlockReflection->getResourceBinding("gShadowSampler");
+    mpRasterPass->getVars()->setSrv(shadowMapLoc, mpShadowMapRenderer->getShadowMapArray()->getSRV());
+    mpRasterPass->getVars()->setSampler(shadowSamplerLoc, mpShadowSampler);
 
-    mpRasterPass->getVars()->setSrv(shadowMapBindLocation, mpShadowMap->getSRV());
-    mpRasterPass->getVars()->setSampler(shadowMapSamplerBindLocation, mpShadowSampler);
+    auto var = mpRasterPass->getVars()->getRootVar();
+    const auto& cascades = mpShadowMapRenderer->getCascades();
+    for (uint32_t i = 0; i < RenderShadowMap::kCascadeCount; i++)
+    {
+        var["CommonParameters"]["gCascadeLightVPs"][i] = cascades[i].lightVP;
+        var["CommonParameters"]["gCascadeSplits"][i]   = cascades[i].splitFar;
+    }
 
-    auto rasterPassVar = mpRasterPass->getVars()->getRootVar();
+    const float kTexelSize = 1.f / float(RenderShadowMap::kShadowMapSize);
+    var["CommonParameters"]["gTexelSize"]        = float2(kTexelSize, kTexelSize);
+    var["CommonParameters"]["globalLightIndex"]  = dirLightIndex;
+    var["CommonParameters"]["gShadowsEnabled"]   = mShadowsEnabled ? 1 : 0;
 
-    rasterPassVar["CommonParameters"]["gLightVP"] = mLightVP;
-    rasterPassVar["CommonParameters"]["gTexelSize"] = 1.f / float2(kShadowRes, kShadowRes);
-    rasterPassVar["CommonParameters"]["gShadowBias"] = 0.001f;
-    rasterPassVar["CommonParameters"]["globalLightIndex"] = dirLightIndex;
-
-    // Render the scene using the raster pass.
+    // 5. Render lighting pass
     mpRasterPass->getState()->setFbo(pTargetFbo);
     mpScene->rasterize(pRenderContext, mpRasterPass->getState().get(), mpRasterPass->getVars().get());
 
@@ -231,11 +196,7 @@ void PathTracingDemo::onGuiRender(Gui* pGui)
 {
     Gui::Window w(pGui, "Falcor", {250, 200});
     renderGlobalUI(pGui);
-    w.text("Hello from PathTracingDemo");
-    if (w.button("Click Here"))
-    {
-        msgBox("Info", "Now why would you do that?");
-    }
+    w.checkbox("Shadows", mShadowsEnabled);
 }
 
 bool PathTracingDemo::onKeyEvent(const KeyboardEvent& keyEvent)
@@ -254,7 +215,6 @@ bool PathTracingDemo::onKeyEvent(const KeyboardEvent& keyEvent)
 
 bool PathTracingDemo::onMouseEvent(const MouseEvent& mouseEvent)
 {
-    // If the scene didn't handle the mouse event, we can return false to let the SampleApp handle it.
     return mpScene && mpScene->onMouseEvent(mouseEvent);
 }
 
