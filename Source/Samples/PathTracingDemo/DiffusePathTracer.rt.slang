@@ -5,7 +5,7 @@ import Rendering.Lights.LightHelpers;
 
 // ---- Constants --------------------------------------------------------------
 
-static const uint kMaxBounces   = 0;
+static const uint kMaxBounces   = 5;
 static const uint kRayTypeCount = 2; // 0 = primary/indirect, 1 = shadow
 
 // ---- Resources --------------------------------------------------------------
@@ -46,7 +46,7 @@ struct ShadowPayload
 [shader("miss")]
 void primaryMiss(inout PathPayload p)
 {
-    p.radiance   = float3(0.38f, 0.52f, 0.10f); // sky colour (matches clear-FBO colour)
+    p.radiance   = float3(0.f, 0.f, 0.f); // for now we dont have physically correct representation of direct sky
     p.terminated = true;
 }
 
@@ -130,7 +130,7 @@ void primaryClosestHit(inout PathPayload p, BuiltInTriangleIntersectionAttribute
         AnalyticLightSample ls;
         evalLightApproximate(sd.posW, light, ls);
 
-        if (dot(sd.frame.N, ls.dir) > 0.f)
+        //if (dot(sd.frame.N, ls.dir) > 0.f)
         {
             float3 shadowOrigin = sd.posW + sd.frame.N * 1e-3f;
             if (traceShadowRay(shadowOrigin, ls.dir, ls.distance))

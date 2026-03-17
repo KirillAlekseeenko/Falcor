@@ -88,6 +88,14 @@ void PathTracingDemo::loadScene(const std::string& scenePath, Fbo* displayFbo)
          .setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp)
          .setComparisonFunc(ComparisonFunc::LessEqual);
     mpShadowSampler = getDevice()->createSampler(sDesc);
+
+    // ---- Brightness scale pass ------------------------------------------
+    mpBrightnessScalePass = FullScreenPass::create(getDevice(), "Samples/PathTracingDemo/BrightnessScale.ps.slang");
+
+    Sampler::Desc bsDesc;
+    bsDesc.setFilterMode(TextureFilteringMode::Linear, TextureFilteringMode::Linear, TextureFilteringMode::Linear)
+          .setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp);
+    mpBrightnessSampler = getDevice()->createSampler(bsDesc);
 }
 
 void PathTracingDemo::onLoad(RenderContext* pRenderContext)
@@ -114,7 +122,28 @@ void PathTracingDemo::onResize(uint32_t width, uint32_t height)
         mpCamera->setAspectRatio((float)width / (float)height);
 
     if (mpRasterPass)
-        mpRasterPass->getState()->setFbo(getTargetFbo());
+    {
+        // (Re)create intermediate HDR FBO at the new resolution
+        auto pColorTex = getDevice()->createTexture2D(
+            width, height,
+            ResourceFormat::RGBA16Float,
+            1, 1,
+            nullptr,
+            ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource
+        );
+        auto pDepthTex = getDevice()->createTexture2D(
+            width, height,
+            ResourceFormat::D32Float,
+            1, 1,
+            nullptr,
+            ResourceBindFlags::DepthStencil
+        );
+        mpHdrFbo = Fbo::create(getDevice());
+        mpHdrFbo->attachColorTarget(pColorTex, 0);
+        mpHdrFbo->attachDepthStencilTarget(pDepthTex);
+
+        mpRasterPass->getState()->setFbo(mpHdrFbo);
+    }
 
     if (mpDiffusePT)
         mpDiffusePT->onResize(width, height);
@@ -166,8 +195,8 @@ void PathTracingDemo::onFrameRender(RenderContext* pRenderContext, const ref<Fbo
     if (mUsePathTracer)
     {
         // ---- Path-traced GI -------------------------------------------------
-        // The path tracer clears and fills pTargetFbo via blit; no explicit clear needed.
-        mpDiffusePT->render(pRenderContext, pTargetFbo, dirLightIndex);
+        // Render into the intermediate HDR FBO; brightness scale pass reads from it.
+        mpDiffusePT->render(pRenderContext, mpHdrFbo, dirLightIndex);
     }
     else
     {
@@ -177,9 +206,9 @@ void PathTracingDemo::onFrameRender(RenderContext* pRenderContext, const ref<Fbo
         if (mShadowsEnabled)
             mpShadowMapRenderer->renderCascades(pRenderContext, lightDir);
 
-        // 3b. Clear target FBO
+        // 3b. Clear intermediate HDR FBO
         const float4 clearColor(0.38f, 0.52f, 0.10f, 1);
-        pRenderContext->clearFbo(pTargetFbo.get(), clearColor, 1.0f, 0, FboAttachmentType::All);
+        pRenderContext->clearFbo(mpHdrFbo.get(), clearColor, 1.0f, 0, FboAttachmentType::All);
 
         // 3c. Bind shadow map array and cascade data
         const auto& pReflection = mpRasterPass->getProgram()->getReflector()->getDefaultParameterBlock();
@@ -203,9 +232,14 @@ void PathTracingDemo::onFrameRender(RenderContext* pRenderContext, const ref<Fbo
         var["CommonParameters"]["gShadowsEnabled"]   = mShadowsEnabled ? 1 : 0;
 
         // 3d. Lighting raster pass
-        mpRasterPass->getState()->setFbo(pTargetFbo);
         mpScene->rasterize(pRenderContext, mpRasterPass->getState().get(), mpRasterPass->getVars().get());
     }
+
+    // ---- Brightness scale pass (HDR → display) --------------------------
+    auto bsVars = mpBrightnessScalePass->getRootVar();
+    bsVars["gInputColor"] = mpHdrFbo->getColorTexture(0);
+    bsVars["gSampler"]    = mpBrightnessSampler;
+    mpBrightnessScalePass->execute(pRenderContext, pTargetFbo);
 
     getTextRenderer().render(pRenderContext, getFrameRate().getMsg(), pTargetFbo, {20, 20});
 }

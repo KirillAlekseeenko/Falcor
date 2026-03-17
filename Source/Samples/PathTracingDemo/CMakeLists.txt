@@ -7,6 +7,7 @@ target_sources(PathTracingDemo PRIVATE
     RenderShadowMap.h
     DiffusePathTracer.cpp
     DiffusePathTracer.h
+    BrightnessScale.ps.slang
 )
 
 target_copy_shaders(PathTracingDemo Samples/PathTracingDemo)

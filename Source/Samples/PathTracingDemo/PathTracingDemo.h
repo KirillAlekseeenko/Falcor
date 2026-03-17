@@ -29,6 +29,7 @@
 #include "Falcor.h"
 #include "Core/SampleApp.h"
 #include "Core/Pass/RasterPass.h"
+#include "Core/Pass/FullScreenPass.h"
 #include "RenderShadowMap.h"
 #include "DiffusePathTracer.h"
 
@@ -65,4 +66,8 @@ private:
 
     std::unique_ptr<DiffusePathTracer> mpDiffusePT;
     bool                               mUsePathTracer = false;
+
+    ref<FullScreenPass> mpBrightnessScalePass;
+    ref<Sampler>        mpBrightnessSampler;
+    ref<Fbo>            mpHdrFbo;             ///< Intermediate HDR render target
 };
