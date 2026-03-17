@@ -79,6 +79,9 @@ void PathTracingDemo::loadScene(const std::string& scenePath, Fbo* displayFbo)
     // ---- Cascaded shadow map --------------------------------------------
     mpShadowMapRenderer = std::make_unique<RenderShadowMap>(getDevice(), mpScene);
 
+    // ---- Diffuse path tracer --------------------------------------------
+    mpDiffusePT = std::make_unique<DiffusePathTracer>(getDevice(), mpScene);
+
     // ---- PCF comparison sampler -----------------------------------------
     Sampler::Desc sDesc;
     sDesc.setFilterMode(TextureFilteringMode::Linear, TextureFilteringMode::Linear, TextureFilteringMode::Point)
@@ -112,6 +115,9 @@ void PathTracingDemo::onResize(uint32_t width, uint32_t height)
 
     if (mpRasterPass)
         mpRasterPass->getState()->setFbo(getTargetFbo());
+
+    if (mpDiffusePT)
+        mpDiffusePT->onResize(width, height);
 }
 
 float3 PathTracingDemo::getFirstDirectionalLightDir(int& dirLightIndex) const
@@ -150,44 +156,56 @@ void PathTracingDemo::onFrameRender(RenderContext* pRenderContext, const ref<Fbo
     int dirLightIndex = -1;
     float3 lightDir = getFirstDirectionalLightDir(dirLightIndex);
 
-    // 2. Render all cascade shadow maps
-    if (mShadowsEnabled)
-        mpShadowMapRenderer->renderCascades(pRenderContext, lightDir);
-
-    // 3. Clear target and tick the scene
-    const float4 clearColor(0.38f, 0.52f, 0.10f, 1);
-    pRenderContext->clearFbo(pTargetFbo.get(), clearColor, 1.0f, 0, FboAttachmentType::All);
-
+    // 2. Tick the scene (animations, updates)
     IScene::UpdateFlags updates = mpScene->update(pRenderContext, getGlobalClock().getTime());
     if (is_set(updates, IScene::UpdateFlags::GeometryChanged))
         FALCOR_THROW("This sample does not support scene geometry changes.");
     if (is_set(updates, IScene::UpdateFlags::RecompileNeeded))
         FALCOR_THROW("This sample does not support scene changes that require shader recompilation.");
 
-    // 4. Bind shadow map array and cascade data to the lighting pass
-    const auto& pReflection = mpRasterPass->getProgram()->getReflector()->getDefaultParameterBlock();
-    auto shadowMapLoc    = pReflection->getResourceBinding("gShadowDepth");
-    auto shadowSamplerLoc = pReflection->getResourceBinding("gShadowSampler");
-
-    mpRasterPass->getVars()->setSrv(shadowMapLoc, mpShadowMapRenderer->getShadowMapArray()->getSRV());
-    mpRasterPass->getVars()->setSampler(shadowSamplerLoc, mpShadowSampler);
-
-    auto var = mpRasterPass->getVars()->getRootVar();
-    const auto& cascades = mpShadowMapRenderer->getCascades();
-    for (uint32_t i = 0; i < RenderShadowMap::kCascadeCount; i++)
+    if (mUsePathTracer)
     {
-        var["CommonParameters"]["gCascadeLightVPs"][i] = cascades[i].lightVP;
-        var["CommonParameters"]["gCascadeSplits"][i]   = cascades[i].splitFar;
+        // ---- Path-traced GI -------------------------------------------------
+        // The path tracer clears and fills pTargetFbo via blit; no explicit clear needed.
+        mpDiffusePT->render(pRenderContext, pTargetFbo, dirLightIndex);
     }
+    else
+    {
+        // ---- Rasterised direct lighting + CSM shadows -----------------------
 
-    const float kTexelSize = 1.f / float(RenderShadowMap::kShadowMapSize);
-    var["CommonParameters"]["gTexelSize"]        = float2(kTexelSize, kTexelSize);
-    var["CommonParameters"]["globalLightIndex"]  = dirLightIndex;
-    var["CommonParameters"]["gShadowsEnabled"]   = mShadowsEnabled ? 1 : 0;
+        // 3a. Render cascade shadow maps
+        if (mShadowsEnabled)
+            mpShadowMapRenderer->renderCascades(pRenderContext, lightDir);
 
-    // 5. Render lighting pass
-    mpRasterPass->getState()->setFbo(pTargetFbo);
-    mpScene->rasterize(pRenderContext, mpRasterPass->getState().get(), mpRasterPass->getVars().get());
+        // 3b. Clear target FBO
+        const float4 clearColor(0.38f, 0.52f, 0.10f, 1);
+        pRenderContext->clearFbo(pTargetFbo.get(), clearColor, 1.0f, 0, FboAttachmentType::All);
+
+        // 3c. Bind shadow map array and cascade data
+        const auto& pReflection = mpRasterPass->getProgram()->getReflector()->getDefaultParameterBlock();
+        auto shadowMapLoc    = pReflection->getResourceBinding("gShadowDepth");
+        auto shadowSamplerLoc = pReflection->getResourceBinding("gShadowSampler");
+
+        mpRasterPass->getVars()->setSrv(shadowMapLoc, mpShadowMapRenderer->getShadowMapArray()->getSRV());
+        mpRasterPass->getVars()->setSampler(shadowSamplerLoc, mpShadowSampler);
+
+        auto var = mpRasterPass->getVars()->getRootVar();
+        const auto& cascades = mpShadowMapRenderer->getCascades();
+        for (uint32_t i = 0; i < RenderShadowMap::kCascadeCount; i++)
+        {
+            var["CommonParameters"]["gCascadeLightVPs"][i] = cascades[i].lightVP;
+            var["CommonParameters"]["gCascadeSplits"][i]   = cascades[i].splitFar;
+        }
+
+        const float kTexelSize = 1.f / float(RenderShadowMap::kShadowMapSize);
+        var["CommonParameters"]["gTexelSize"]        = float2(kTexelSize, kTexelSize);
+        var["CommonParameters"]["globalLightIndex"]  = dirLightIndex;
+        var["CommonParameters"]["gShadowsEnabled"]   = mShadowsEnabled ? 1 : 0;
+
+        // 3d. Lighting raster pass
+        mpRasterPass->getState()->setFbo(pTargetFbo);
+        mpScene->rasterize(pRenderContext, mpRasterPass->getState().get(), mpRasterPass->getVars().get());
+    }
 
     getTextRenderer().render(pRenderContext, getFrameRate().getMsg(), pTargetFbo, {20, 20});
 }
@@ -196,7 +214,12 @@ void PathTracingDemo::onGuiRender(Gui* pGui)
 {
     Gui::Window w(pGui, "Falcor", {250, 200});
     renderGlobalUI(pGui);
-    w.checkbox("Shadows", mShadowsEnabled);
+
+    if (w.checkbox("Path Tracing", mUsePathTracer) && !mUsePathTracer)
+        mpDiffusePT->reset(); // clear accumulation when switching back in
+
+    if (!mUsePathTracer)
+        w.checkbox("Shadows", mShadowsEnabled);
 }
 
 bool PathTracingDemo::onKeyEvent(const KeyboardEvent& keyEvent)

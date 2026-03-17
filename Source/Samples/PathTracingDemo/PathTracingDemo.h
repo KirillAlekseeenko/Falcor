@@ -30,6 +30,7 @@
 #include "Core/SampleApp.h"
 #include "Core/Pass/RasterPass.h"
 #include "RenderShadowMap.h"
+#include "DiffusePathTracer.h"
 
 using namespace Falcor;
 
@@ -58,7 +59,10 @@ private:
 
     ref<RasterPass> mpRasterPass;
 
-    std::unique_ptr<RenderShadowMap> mpShadowMapRenderer;
-    ref<Sampler>                     mpShadowSampler;     ///< Comparison sampler for PCF
-    bool                             mShadowsEnabled = true;
+    std::unique_ptr<RenderShadowMap>   mpShadowMapRenderer;
+    ref<Sampler>                       mpShadowSampler;     ///< Comparison sampler for PCF
+    bool                               mShadowsEnabled = true;
+
+    std::unique_ptr<DiffusePathTracer> mpDiffusePT;
+    bool                               mUsePathTracer = false;
 };

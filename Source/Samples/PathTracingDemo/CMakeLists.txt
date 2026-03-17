@@ -5,6 +5,8 @@ target_sources(PathTracingDemo PRIVATE
     PathTracingDemo.h
     RenderShadowMap.cpp
     RenderShadowMap.h
+    DiffusePathTracer.cpp
+    DiffusePathTracer.h
 )
 
 target_copy_shaders(PathTracingDemo Samples/PathTracingDemo)
