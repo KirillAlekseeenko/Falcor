@@ -8,6 +8,9 @@ target_sources(PathTracingDemo PRIVATE
     DiffusePathTracer.cpp
     DiffusePathTracer.h
     BrightnessScale.ps.slang
+    DiffusePathTracer.rt.slang
+    ShadowPass.3d.slang
+    SimpleRasterPass.3d.slang
 )
 
 target_copy_shaders(PathTracingDemo Samples/PathTracingDemo)

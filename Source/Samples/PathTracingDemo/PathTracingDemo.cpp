@@ -49,6 +49,7 @@ PathTracingDemo::~PathTracingDemo()
 void PathTracingDemo::loadScene(const std::string& scenePath, Fbo* displayFbo)
 {
     mpScene  = Scene::create(getDevice(), scenePath);
+    mpScene->setIsAnimated(false);
     mpCamera = mpScene->getCamera();
 
     // Update the controllers
