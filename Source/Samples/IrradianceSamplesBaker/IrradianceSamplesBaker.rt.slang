@@ -76,36 +76,27 @@ void rayGen()
 
     if (isSurfaceCandidate)
     {
-        const GeometryInstanceID instanceID = GeometryInstanceID(candidate.meta.x, 0);
-        const float4x4 worldMatrix = gScene.getWorldMatrix(instanceID);
-        const float3x3 worldInvTranspose = gScene.getInverseTransposeWorldMatrix(instanceID);
-
-        samplePosition = mul(worldMatrix, float4(samplePosition, 1.f)).xyz;
-        sampleNormal = normalize(mul(worldInvTranspose, sampleNormal));
         samplePosition += sampleNormal * gSurfaceOffset;
     }
 
     uint hitCount = 0;
     uint backfaceCount = 0;
 
-    if (!isSurfaceCandidate)
+    [loop]
+    for (uint probeIndex = 0; probeIndex < gProbeRayCount; ++probeIndex)
     {
-        [loop]
-        for (uint probeIndex = 0; probeIndex < gProbeRayCount; ++probeIndex)
-        {
-            ProbePayload payload = {0u, 0u};
+        ProbePayload payload = {0u, 0u};
 
-            RayDesc ray;
-            ray.Origin = samplePosition;
-            ray.Direction = sample_sphere(getHammersley(probeIndex, gProbeRayCount));
-            ray.TMin = max(gSurfaceOffset * 0.5f, 1e-4f);
-            ray.TMax = 1e30f;
+        RayDesc ray;
+        ray.Origin = samplePosition;
+        ray.Direction = sample_sphere(getHammersley(probeIndex, gProbeRayCount));
+        ray.TMin = max(gSurfaceOffset * 0.5f, 1e-4f);
+        ray.TMax = 1e30f;
 
-            TraceRayScene(RAY_FLAG_NONE, 0xFF, 0, 0, ray, payload);
+        TraceRayScene(RAY_FLAG_NONE, 0xFF, 0, 0, ray, payload);
 
-            hitCount += payload.hit;
-            backfaceCount += payload.backface;
-        }
+        hitCount += payload.hit;
+        backfaceCount += payload.backface;
     }
 
     BakeResultData result;

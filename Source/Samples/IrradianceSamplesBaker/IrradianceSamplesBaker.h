@@ -1,8 +1,11 @@
 #pragma once
+#include "IrradianceSampleDebugVis.h"
 #include "Falcor.h"
 #include "Core/SampleApp.h"
+#include "Core/Pass/RasterPass.h"
 
 #include <filesystem>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -40,13 +43,6 @@ private:
         uint4 meta = uint4(0u);
     };
 
-    struct StoredSample
-    {
-        float4 position = float4(0.f);
-        float4 normal = float4(0.f, 1.f, 0.f, 0.f);
-        uint4 meta = uint4(0u);
-    };
-
     struct MeshSamplingData
     {
         std::vector<float3> positions;
@@ -60,6 +56,8 @@ private:
     {
         uint32_t instanceID = 0;
         uint32_t meshID = 0;
+        float4x4 worldMatrix = float4x4::identity();
+        std::vector<double> triangleAreaCdf;
         double totalArea = 0.0;
     };
 
@@ -75,23 +73,16 @@ private:
         std::filesystem::path outputPath;
     };
 
-    struct BakeFileHeader
-    {
-        uint32_t magic = 0x31534249; // "IBS1"
-        uint32_t version = 1;
-        uint32_t sampleCount = 0;
-        uint32_t surfaceSampleCount = 0;
-        float surfaceSampleRatio = 0.f;
-        float backfaceThreshold = 0.f;
-        float surfaceOffset = 0.f;
-        uint32_t reserved = 0u;
-    };
+    using StoredSample = IrradianceSampleDebugVis::Sample;
+    using BakeFileHeader = IrradianceSampleDebugVis::FileHeader;
 
     void loadScene(const std::string& scenePath, RenderContext* pRenderContext);
     void createBakeProgram();
+    void createSceneRasterPass();
     void invalidateSamplingCache();
     void buildSamplingCache();
     void bake(RenderContext* pRenderContext);
+    void renderScenePreview(RenderContext* pRenderContext, const ref<Fbo>& pTargetFbo);
 
     std::vector<BakeCandidateData> generateSurfaceCandidates(uint32_t count);
     std::vector<BakeCandidateData> generateVolumeCandidates(uint32_t count);
@@ -106,14 +97,16 @@ private:
     static float3 sampleUnitVector(std::mt19937_64& rng);
 
 private:
-    static constexpr uint32_t kSurfaceCandidateFlag = 1u;
+    static constexpr uint32_t kSurfaceCandidateFlag = IrradianceSampleDebugVis::kSurfaceSampleFlag;
     static constexpr uint32_t kProbeRayCount = 32u;
-    static constexpr uint32_t kMaxVolumeAttempts = 12u;
+    static constexpr uint32_t kMaxCandidateAttempts = 12u;
 
     ref<Scene> mpScene;
     ref<Camera> mpCamera;
     ref<Program> mpBakeProgram;
     ref<RtProgramVars> mpBakeVars;
+    ref<RasterPass> mpSceneRasterPass;
+    std::unique_ptr<IrradianceSampleDebugVis> mpDebugVis;
 
     std::vector<MeshSamplingData> mMeshSamplingData;
     std::vector<SurfaceInstanceData> mSurfaceInstances;

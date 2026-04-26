@@ -3,6 +3,7 @@
 #include "Utils/UI/TextRenderer.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <fstream>
 #include <map>
@@ -16,6 +17,17 @@ const char kDefaultScenePath[] = "Bistro_v5_2/BistroExterior.pyscene";
 const uint32_t kGuiWidth = 440;
 const float kSurfaceOffsetScale = 1e-5f;
 const float kPi = 3.14159265358979323846f;
+
+float3 computeUnnormalizedWorldNormal(const float4x4& worldMatrix, const std::vector<float3>& vertexPositions, const uint3& triangleIndices)
+{
+    const float4 p0H = math::mul(worldMatrix, float4(vertexPositions[triangleIndices.x], 1.f));
+    const float4 p1H = math::mul(worldMatrix, float4(vertexPositions[triangleIndices.y], 1.f));
+    const float4 p2H = math::mul(worldMatrix, float4(vertexPositions[triangleIndices.z], 1.f));
+    const float3 p0(p0H.x, p0H.y, p0H.z);
+    const float3 p1(p1H.x, p1H.y, p1H.z);
+    const float3 p2(p2H.x, p2H.y, p2H.z);
+    return cross(p1 - p0, p2 - p0);
+}
 }
 
 IrradianceSamplesBaker::IrradianceSamplesBaker(const SampleAppConfig& config)
@@ -30,6 +42,7 @@ void IrradianceSamplesBaker::onLoad(RenderContext* pRenderContext)
     if (!getDevice()->isFeatureSupported(Device::SupportedFeatures::Raytracing))
         FALCOR_THROW("Device does not support raytracing.");
 
+    mpDebugVis = std::make_unique<IrradianceSampleDebugVis>(getDevice());
     loadScene(kDefaultScenePath, pRenderContext);
 }
 
@@ -69,15 +82,19 @@ void IrradianceSamplesBaker::onFrameRender(RenderContext* pRenderContext, const 
         }
     }
 
+    renderScenePreview(pRenderContext, pTargetFbo);
+    if (mpDebugVis)
+        mpDebugVis->render(pRenderContext, pTargetFbo);
+
     getTextRenderer().render(pRenderContext, getFrameRate().getMsg(), pTargetFbo, {20, 20});
 }
 
 void IrradianceSamplesBaker::onGuiRender(Gui* pGui)
 {
-    Gui::Window window(pGui, "Irradiance Samples Baker", {kGuiWidth, 320});
+    Gui::Window window(pGui, "Irradiance Samples Baker", {kGuiWidth, 460});
     renderGlobalUI(pGui);
 
-    window.text("Drop a .pyscene file into the window to switch scenes.");
+    window.text("Drop a .pyscene file to switch scenes or a baked .bin file to inspect samples.");
 
     int sampleCount = static_cast<int>(mRequestedSampleCount);
     if (window.var("Sample Count", sampleCount, 1, 1 << 24))
@@ -95,6 +112,29 @@ void IrradianceSamplesBaker::onGuiRender(Gui* pGui)
 
     if (window.button("Bake"))
         mBakeRequested = true;
+
+    if (window.button("Load Current Bake"))
+    {
+        try
+        {
+            if (mpDebugVis)
+            {
+                mpDebugVis->loadSamplesFromFile(outputPath);
+                mStatusMessage = fmt::format("Loaded {} debug samples from {}", mpDebugVis->getLoadedSampleCount(), outputPath.string());
+            }
+        }
+        catch (const std::exception& e)
+        {
+            mStatusMessage = std::string("Failed to load baked samples: ") + e.what();
+            logError("{}", mStatusMessage);
+        }
+    }
+
+    if (mpDebugVis)
+    {
+        window.separator();
+        mpDebugVis->renderUI(window);
+    }
 
     window.separator();
     window.text(mStatusMessage);
@@ -142,11 +182,37 @@ void IrradianceSamplesBaker::onDroppedFile(const std::filesystem::path& path)
 {
     try
     {
-        loadScene(path.string(), getRenderContext());
+        std::string extension = path.extension().string();
+        std::transform(
+            extension.begin(),
+            extension.end(),
+            extension.begin(),
+            [](unsigned char c)
+            {
+                return static_cast<char>(std::tolower(c));
+            }
+        );
+
+        if (extension == ".pyscene")
+        {
+            loadScene(path.string(), getRenderContext());
+        }
+        else if (extension == ".bin")
+        {
+            if (mpDebugVis)
+            {
+                mpDebugVis->loadSamplesFromFile(path);
+                mStatusMessage = fmt::format("Loaded {} debug samples from {}", mpDebugVis->getLoadedSampleCount(), path.string());
+            }
+        }
+        else
+        {
+            mStatusMessage = fmt::format("Ignored dropped file '{}'.", path.string());
+        }
     }
     catch (const std::exception& e)
     {
-        mStatusMessage = std::string("Failed to load dropped scene: ") + e.what();
+        mStatusMessage = std::string("Failed to load dropped file: ") + e.what();
         logError("{}", mStatusMessage);
     }
 }
@@ -154,7 +220,12 @@ void IrradianceSamplesBaker::onDroppedFile(const std::filesystem::path& path)
 void IrradianceSamplesBaker::onHotReload(HotReloadFlags reloaded)
 {
     if (is_set(reloaded, HotReloadFlags::Program))
+    {
         createBakeProgram();
+        createSceneRasterPass();
+        if (mpDebugVis)
+            mpDebugVis->onHotReload();
+    }
 }
 
 void IrradianceSamplesBaker::loadScene(const std::string& scenePath, RenderContext* pRenderContext)
@@ -182,6 +253,9 @@ void IrradianceSamplesBaker::loadScene(const std::string& scenePath, RenderConte
         FALCOR_THROW("This prototype baker currently supports scenes containing triangle meshes only.");
 
     createBakeProgram();
+    createSceneRasterPass();
+    if (mpDebugVis)
+        mpDebugVis->setScene(mpScene, mpCamera);
     invalidateSamplingCache();
 
     mStatusMessage = fmt::format("Loaded scene '{}'.", scenePath);
@@ -213,6 +287,28 @@ void IrradianceSamplesBaker::createBakeProgram()
 
     mpBakeProgram = Program::create(getDevice(), desc, mpScene->getSceneDefines());
     mpBakeVars = RtProgramVars::create(getDevice(), mpBakeProgram, sbt);
+}
+
+void IrradianceSamplesBaker::createSceneRasterPass()
+{
+    if (!mpScene)
+        return;
+
+    ProgramDesc desc;
+    desc.addShaderModules(mpScene->getShaderModules());
+    desc.addShaderLibrary("Samples/IrradianceSamplesBaker/IrradianceSamplesBaker.3d.slang").vsEntry("vsMain").psEntry("psMain");
+    desc.addTypeConformances(mpScene->getTypeConformances());
+
+    mpSceneRasterPass = RasterPass::create(getDevice(), desc, mpScene->getSceneDefines());
+}
+
+void IrradianceSamplesBaker::renderScenePreview(RenderContext* pRenderContext, const ref<Fbo>& pTargetFbo)
+{
+    if (!mpScene || !mpSceneRasterPass)
+        return;
+
+    mpSceneRasterPass->getState()->setFbo(pTargetFbo);
+    mpScene->rasterize(pRenderContext, mpSceneRasterPass->getState().get(), mpSceneRasterPass->getVars().get());
 }
 
 void IrradianceSamplesBaker::invalidateSamplingCache()
@@ -282,6 +378,10 @@ void IrradianceSamplesBaker::buildSamplingCache()
         data.totalArea = areaSum;
     }
 
+    const auto* pAnimationController = mpScene->getAnimationController();
+    FALCOR_CHECK(pAnimationController != nullptr, "Scene is missing an animation controller.");
+    const auto& globalMatrices = pAnimationController->getGlobalMatrices();
+
     const auto instanceIDs = mpScene->getGeometryInstanceIDsByType(Scene::GeometryType::TriangleMesh);
     double instanceAreaSum = 0.0;
     for (uint32_t instanceID : instanceIDs)
@@ -291,11 +391,34 @@ void IrradianceSamplesBaker::buildSamplingCache()
         if (meshIndex >= mMeshSamplingData.size())
             continue;
 
-        const double totalArea = mMeshSamplingData[meshIndex].totalArea;
+        if (instance.globalMatrixID >= globalMatrices.size())
+            continue;
+
+        const auto& meshData = mMeshSamplingData[meshIndex];
+        if (meshData.triangleIndices.empty())
+            continue;
+
+        SurfaceInstanceData instanceData;
+        instanceData.instanceID = instanceID;
+        instanceData.meshID = meshIndex;
+        instanceData.worldMatrix = globalMatrices[instance.globalMatrixID];
+        instanceData.triangleAreaCdf.reserve(meshData.triangleIndices.size());
+
+        double totalArea = 0.0;
+        for (const auto& tri : meshData.triangleIndices)
+        {
+            const double triangleArea = 0.5 * static_cast<double>(
+                length(computeUnnormalizedWorldNormal(instanceData.worldMatrix, meshData.positions, tri))
+            );
+            totalArea += triangleArea;
+            instanceData.triangleAreaCdf.push_back(totalArea);
+        }
+
         if (totalArea <= 0.0)
             continue;
 
-        mSurfaceInstances.push_back({instanceID, meshIndex, totalArea});
+        instanceData.totalArea = totalArea;
+        mSurfaceInstances.push_back(std::move(instanceData));
         instanceAreaSum += totalArea;
         mSurfaceInstanceCdf.push_back(instanceAreaSum);
     }
@@ -319,18 +442,26 @@ std::vector<IrradianceSamplesBaker::BakeCandidateData> IrradianceSamplesBaker::g
         const auto& instance = mSurfaceInstances[instanceIndex];
         const auto& meshData = mMeshSamplingData[instance.meshID];
 
-        const uint32_t triangleIndex = sampleCdfIndex(meshData.triangleAreaCdf, unit01(mRng));
-        const uint3 tri = meshData.triangleIndices[triangleIndex];
+        const uint32_t triangleIndex = sampleCdfIndex(instance.triangleAreaCdf, unit01(mRng));
+        const uint3 triangleIndices = meshData.triangleIndices[triangleIndex];
 
         const float3 bary = sampleTriangleBarycentrics(static_cast<float>(unit01(mRng)), static_cast<float>(unit01(mRng)));
         const float3 localPosition =
-            meshData.positions[tri.x] * bary.x +
-            meshData.positions[tri.y] * bary.y +
-            meshData.positions[tri.z] * bary.z;
+            meshData.positions[triangleIndices.x] * bary.x +
+            meshData.positions[triangleIndices.y] * bary.y +
+            meshData.positions[triangleIndices.z] * bary.z;
+
+        float3 worldNormal = computeUnnormalizedWorldNormal(instance.worldMatrix, meshData.positions, triangleIndices);
+        if (const float normalLength = length(worldNormal); normalLength > 0.f)
+            worldNormal /= normalLength;
+        else
+            worldNormal = float3(0.f, 1.f, 0.f);
+
+        const float4 samplePositionH = math::mul(instance.worldMatrix, float4(localPosition, 1.f));
 
         BakeCandidateData candidate;
-        candidate.position = float4(localPosition, 1.f);
-        candidate.normal = float4(meshData.triangleNormals[triangleIndex], 0.f);
+        candidate.position = float4(samplePositionH.x, samplePositionH.y, samplePositionH.z, 1.f);
+        candidate.normal = float4(worldNormal, 0.f);
         candidate.meta = uint4(instance.instanceID, kSurfaceCandidateFlag, 0u, 0u);
         candidates.push_back(candidate);
     }
@@ -414,82 +545,105 @@ void IrradianceSamplesBaker::bake(RenderContext* pRenderContext)
     mStatusMessage = "Baking samples...";
     logInfo("Starting bake for {} samples (surface ratio {}, backface threshold {}).", clampedRequestedCount, mSurfaceSampleRatio, mBackfaceThreshold);
 
+    auto passesBackfaceThreshold = [this](uint32_t hitCount, uint32_t backfaceCount)
+    {
+        const float backfaceRatio = hitCount > 0 ? static_cast<float>(backfaceCount) / static_cast<float>(hitCount) : 0.f;
+        return backfaceRatio <= mBackfaceThreshold;
+    };
+
+    struct AcceptanceStats
+    {
+        uint32_t acceptedCount = 0;
+        uint32_t testedCandidateCount = 0;
+    };
+
     std::vector<StoredSample> finalSamples;
     finalSamples.reserve(clampedRequestedCount);
 
-    if (surfaceTarget > 0)
+    auto collectAcceptedSamples =
+        [&](uint32_t targetCount, uint32_t sampleFlag, const char* sampleLabel, auto&& generateCandidates)
     {
-        const auto surfaceCandidates = generateSurfaceCandidates(surfaceTarget);
-        const auto surfaceResults = resolveCandidates(pRenderContext, surfaceCandidates);
+        AcceptanceStats stats;
 
-        for (const auto& result : surfaceResults)
+        for (uint32_t attempt = 0; attempt < kMaxCandidateAttempts && stats.acceptedCount < targetCount; ++attempt)
         {
-            StoredSample sample;
-            sample.position = result.position;
-            sample.normal = result.normal;
-            sample.meta = uint4(kSurfaceCandidateFlag, 0u, 0u, 0u);
-            finalSamples.push_back(sample);
+            const uint32_t remaining = targetCount - stats.acceptedCount;
+            const uint32_t batchSize = std::max(remaining * 2u, 1024u);
+
+            auto candidates = generateCandidates(batchSize);
+            auto results = resolveCandidates(pRenderContext, candidates);
+            stats.testedCandidateCount += batchSize;
+
+            for (const auto& result : results)
+            {
+                const uint32_t hitCount = result.meta.x;
+                const uint32_t backfaceCount = result.meta.y;
+                if (!passesBackfaceThreshold(hitCount, backfaceCount))
+                    continue;
+
+                StoredSample sample;
+                sample.position = result.position;
+                sample.normal = result.normal;
+                sample.meta = uint4(sampleFlag, hitCount, backfaceCount, 0u);
+                finalSamples.push_back(sample);
+                ++stats.acceptedCount;
+
+                if (stats.acceptedCount >= targetCount)
+                    break;
+            }
         }
-    }
 
-    uint32_t acceptedVolumeCount = 0;
-    uint32_t testedVolumeCandidateCount = 0;
-
-    for (uint32_t attempt = 0; attempt < kMaxVolumeAttempts && acceptedVolumeCount < volumeTarget; ++attempt)
-    {
-        const uint32_t remaining = volumeTarget - acceptedVolumeCount;
-        const uint32_t batchSize = std::max(remaining * 2u, 1024u);
-
-        auto volumeCandidates = generateVolumeCandidates(batchSize);
-        auto volumeResults = resolveCandidates(pRenderContext, volumeCandidates);
-        testedVolumeCandidateCount += batchSize;
-
-        for (const auto& result : volumeResults)
+        if (stats.acceptedCount < targetCount)
         {
-            const uint32_t hitCount = result.meta.x;
-            const uint32_t backfaceCount = result.meta.y;
-            const float backfaceRatio = hitCount > 0 ? static_cast<float>(backfaceCount) / static_cast<float>(hitCount) : 0.f;
-
-            if (backfaceRatio > mBackfaceThreshold)
-                continue;
-
-            StoredSample sample;
-            sample.position = result.position;
-            sample.normal = result.normal;
-            sample.meta = uint4(0u, hitCount, backfaceCount, 0u);
-            finalSamples.push_back(sample);
-            ++acceptedVolumeCount;
-
-            if (acceptedVolumeCount >= volumeTarget)
-                break;
+            logWarning(
+                "Only accepted {} out of {} requested {} samples after {} candidate rays.",
+                stats.acceptedCount,
+                targetCount,
+                sampleLabel,
+                stats.testedCandidateCount
+            );
         }
-    }
 
-    if (acceptedVolumeCount < volumeTarget)
-    {
-        logWarning(
-            "Only accepted {} out of {} requested volume samples after {} candidate rays.",
-            acceptedVolumeCount,
-            volumeTarget,
-            testedVolumeCandidateCount
-        );
-    }
+        return stats;
+    };
+
+    const auto surfaceStats = collectAcceptedSamples(
+        surfaceTarget,
+        kSurfaceCandidateFlag,
+        "surface",
+        [&](uint32_t batchSize)
+        {
+            return generateSurfaceCandidates(batchSize);
+        }
+    );
+
+    const auto volumeStats = collectAcceptedSamples(
+        volumeTarget,
+        0u,
+        "volume",
+        [&](uint32_t batchSize)
+        {
+            return generateVolumeCandidates(batchSize);
+        }
+    );
 
     const auto outputPath = getDefaultOutputPath();
-    if (!saveSamples(finalSamples, surfaceTarget, outputPath))
+    if (!saveSamples(finalSamples, surfaceStats.acceptedCount, outputPath))
         FALCOR_THROW("Failed to save baked sample file '{}'.", outputPath);
+    if (mpDebugVis)
+        mpDebugVis->loadSamplesFromFile(outputPath);
 
     mLastBakeSummary.requestedSampleCount = clampedRequestedCount;
     mLastBakeSummary.surfaceTargetCount = surfaceTarget;
     mLastBakeSummary.volumeTargetCount = volumeTarget;
-    mLastBakeSummary.acceptedSurfaceCount = surfaceTarget;
-    mLastBakeSummary.acceptedVolumeCount = acceptedVolumeCount;
-    mLastBakeSummary.testedVolumeCandidateCount = testedVolumeCandidateCount;
+    mLastBakeSummary.acceptedSurfaceCount = surfaceStats.acceptedCount;
+    mLastBakeSummary.acceptedVolumeCount = volumeStats.acceptedCount;
+    mLastBakeSummary.testedVolumeCandidateCount = volumeStats.testedCandidateCount;
     mLastBakeSummary.finalSampleCount = static_cast<uint32_t>(finalSamples.size());
     mLastBakeSummary.outputPath = outputPath;
 
     mStatusMessage = fmt::format(
-        "Bake complete: {} samples written to {}",
+        "Bake complete: {} samples written to {} and loaded for debug.",
         mLastBakeSummary.finalSampleCount,
         outputPath.string()
     );
