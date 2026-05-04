@@ -40,6 +40,7 @@ private:
     {
         float4 position = float4(0.f);
         float4 normal = float4(0.f, 1.f, 0.f, 0.f);
+        float4 irradiance = float4(0.f);
         uint4 meta = uint4(0u);
     };
 
@@ -83,6 +84,7 @@ private:
     void buildSamplingCache();
     void bake(RenderContext* pRenderContext);
     void renderScenePreview(RenderContext* pRenderContext, const ref<Fbo>& pTargetFbo);
+    uint32_t getFirstDirectionalLightIndex() const;
 
     std::vector<BakeCandidateData> generateSurfaceCandidates(uint32_t count);
     std::vector<BakeCandidateData> generateVolumeCandidates(uint32_t count);
@@ -99,6 +101,7 @@ private:
 private:
     static constexpr uint32_t kSurfaceCandidateFlag = IrradianceSampleDebugVis::kSurfaceSampleFlag;
     static constexpr uint32_t kProbeRayCount = 32u;
+    static constexpr uint32_t kIrradianceRayCount = 64u;
     static constexpr uint32_t kMaxCandidateAttempts = 12u;
 
     ref<Scene> mpScene;

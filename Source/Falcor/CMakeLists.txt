@@ -216,6 +216,9 @@ target_sources(Falcor PRIVATE
     Rendering/Lights/LightBVHSamplerSharedDefinitions.slang
     Rendering/Lights/LightBVHTypes.slang
     Rendering/Lights/LightHelpers.slang
+    Rendering/NeuralIrradianceModel.cpp
+    Rendering/NeuralIrradianceModel.h
+    Rendering/NeuralIrradianceModel.slang
 
     Rendering/Materials/AnisotropicGGX.slang
     Rendering/Materials/BCSDFConfig.slangh

@@ -76,6 +76,9 @@ target_sources(FalcorTest PRIVATE
     Tests/Scene/Material/HairChiang16Tests.cs.slang
     Tests/Scene/Material/MERLFileTests.cpp
 
+    Tests/Samples/NeuralIrradianceModelTests.cpp
+    Tests/Samples/NeuralIrradianceModelInference.cs.slang
+
     Tests/Slang/Atomics.cpp
     Tests/Slang/Atomics.cs.slang
     Tests/Slang/CastFloat16.cpp

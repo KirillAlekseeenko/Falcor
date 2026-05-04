@@ -270,20 +270,26 @@ void IrradianceSamplesBaker::createBakeProgram()
     const uint32_t geometryCount = mpScene->getGeometryCount();
     const auto meshIDs = mpScene->getGeometryIDs(Scene::GeometryType::TriangleMesh);
 
-    auto sbt = RtBindingTable::create(1, 1, geometryCount);
+    auto sbt = RtBindingTable::create(3, 3, geometryCount);
 
     ProgramDesc desc;
     desc.addShaderModules(mpScene->getShaderModules());
     desc.addShaderLibrary("Samples/IrradianceSamplesBaker/IrradianceSamplesBaker.rt.slang");
     desc.addTypeConformances(mpScene->getTypeConformances());
-    desc.setMaxTraceRecursionDepth(1);
-    desc.setMaxPayloadSize(sizeof(uint32_t) * 2);
+    desc.setMaxTraceRecursionDepth(2);
+    desc.setMaxPayloadSize(80);
 
     sbt->setRayGen(desc.addRayGen("rayGen"));
     sbt->setMiss(0, desc.addMiss("probeMiss"));
+    sbt->setMiss(1, desc.addMiss("primaryMiss"));
+    sbt->setMiss(2, desc.addMiss("shadowMiss"));
 
-    auto hitGroup = desc.addHitGroup("probeClosestHit", "probeAnyHit");
-    sbt->setHitGroup(0, meshIDs, hitGroup);
+    auto probeHitGroup = desc.addHitGroup("probeClosestHit", "probeAnyHit");
+    auto primaryHitGroup = desc.addHitGroup("primaryClosestHit", "primaryAnyHit");
+    auto shadowHitGroup = desc.addHitGroup("", "shadowAnyHit");
+    sbt->setHitGroup(0, meshIDs, probeHitGroup);
+    sbt->setHitGroup(1, meshIDs, primaryHitGroup);
+    sbt->setHitGroup(2, meshIDs, shadowHitGroup);
 
     mpBakeProgram = Program::create(getDevice(), desc, mpScene->getSceneDefines());
     mpBakeVars = RtProgramVars::create(getDevice(), mpBakeProgram, sbt);
@@ -523,7 +529,10 @@ std::vector<IrradianceSamplesBaker::BakeResultData> IrradianceSamplesBaker::reso
     rootVar["gResults"] = pResultBuffer;
     rootVar["BakeParams"]["gSampleCount"] = static_cast<uint32_t>(candidates.size());
     rootVar["BakeParams"]["gProbeRayCount"] = kProbeRayCount;
+    rootVar["BakeParams"]["gIrradianceRayCount"] = kIrradianceRayCount;
+    rootVar["BakeParams"]["gDirLightIndex"] = getFirstDirectionalLightIndex();
     rootVar["BakeParams"]["gSurfaceOffset"] = getSurfaceOffset();
+    rootVar["BakeParams"]["gBackfaceThreshold"] = mBackfaceThreshold;
 
     mpScene->raytrace(pRenderContext, mpBakeProgram.get(), mpBakeVars, uint3(static_cast<uint32_t>(candidates.size()), 1u, 1u));
 
@@ -584,6 +593,7 @@ void IrradianceSamplesBaker::bake(RenderContext* pRenderContext)
                 StoredSample sample;
                 sample.position = result.position;
                 sample.normal = result.normal;
+                sample.irradiance = result.irradiance;
                 sample.meta = uint4(sampleFlag, hitCount, backfaceCount, 0u);
                 finalSamples.push_back(sample);
                 ++stats.acceptedCount;
@@ -648,6 +658,21 @@ void IrradianceSamplesBaker::bake(RenderContext* pRenderContext)
         outputPath.string()
     );
     logInfo("{}", mStatusMessage);
+}
+
+uint32_t IrradianceSamplesBaker::getFirstDirectionalLightIndex() const
+{
+    if (!mpScene)
+        return 0xFFFFFFFFu;
+
+    for (uint32_t i = 0; i < mpScene->getLightCount(); ++i)
+    {
+        const auto& pLight = mpScene->getLight(i);
+        if (pLight->getType() == LightType::Directional)
+            return i;
+    }
+
+    return 0xFFFFFFFFu;
 }
 
 std::filesystem::path IrradianceSamplesBaker::getDefaultOutputPath() const
