@@ -10,10 +10,10 @@ DiffusePathTracer::DiffusePathTracer(ref<Device> pDevice, ref<Scene> pScene)
     : mpDevice(pDevice)
     , mpScene(pScene)
 {
-    createProgram();
+    recreatePrograms();
 }
 
-void DiffusePathTracer::createProgram()
+void DiffusePathTracer::createProgram(bool useNeuralIndirect, ref<Program>& pProgram, ref<RtProgramVars>& pVars)
 {
     // Two miss shaders (primary, shadow), two ray types (primary, shadow).
     uint32_t geometryCount = mpScene->getGeometryCount();
@@ -37,8 +37,18 @@ void DiffusePathTracer::createProgram()
     sbt->setHitGroup(0, meshIDs, primaryHitGroup);
     sbt->setHitGroup(1, meshIDs, shadowHitGroup);
 
-    mpProgram = Program::create(mpDevice, desc, mpScene->getSceneDefines());
-    mpVars    = RtProgramVars::create(mpDevice, mpProgram, sbt);
+    DefineList defines = mpScene->getSceneDefines();
+    defines.add("USE_NEURAL_INDIRECT", useNeuralIndirect ? "1" : "0");
+
+    pProgram = Program::create(mpDevice, desc, defines);
+    pVars    = RtProgramVars::create(mpDevice, pProgram, sbt);
+}
+
+void DiffusePathTracer::recreatePrograms()
+{
+    createProgram(false, mpReferenceProgram, mpReferenceVars);
+    createProgram(true, mpNeuralProgram, mpNeuralVars);
+    reset();
 }
 
 void DiffusePathTracer::createAccumTexture(uint32_t width, uint32_t height)
@@ -69,8 +79,19 @@ void DiffusePathTracer::onResize(uint32_t width, uint32_t height)
 // Per-frame render
 // =============================================================================
 
-void DiffusePathTracer::render(RenderContext* pRenderContext, const ref<Fbo>& pTargetFbo, int dirLightIndex)
+void DiffusePathTracer::render(
+    RenderContext* pRenderContext,
+    const ref<Fbo>& pTargetFbo,
+    int dirLightIndex,
+    Mode mode,
+    const NeuralIrradianceModel* pNeuralModel,
+    float neuralIndirectScale,
+    float surfaceOffset
+)
 {
+    if (mode == Mode::NeuralIndirect && (pNeuralModel == nullptr || !pNeuralModel->isLoaded()))
+        mode = Mode::Reference;
+
     // Lazy texture creation (first frame or after resize).
     uint32_t w = pTargetFbo->getWidth();
     uint32_t h = pTargetFbo->getHeight();
@@ -85,19 +106,36 @@ void DiffusePathTracer::render(RenderContext* pRenderContext, const ref<Fbo>& pT
         mFrameIndex   = 0;
     }
 
+    if (mode != mPreviousMode || neuralIndirectScale != mPreviousNeuralIndirectScale || surfaceOffset != mPreviousSurfaceOffset)
+    {
+        mPreviousMode = mode;
+        mPreviousNeuralIndirectScale = neuralIndirectScale;
+        mPreviousSurfaceOffset = surfaceOffset;
+        reset();
+    }
+
+    ref<Program> pProgram = mode == Mode::NeuralIndirect ? mpNeuralProgram : mpReferenceProgram;
+    ref<RtProgramVars> pVars = mode == Mode::NeuralIndirect ? mpNeuralVars : mpReferenceVars;
+
     // Bind per-frame constants.
-    auto var = mpVars->getRootVar();
+    auto var = pVars->getRootVar();
     var["PerFrame"]["gFrameDim"]      = uint2(w, h);
     var["PerFrame"]["gFrameIndex"]    = mFrameIndex;
     var["PerFrame"]["gDirLightIndex"] = dirLightIndex >= 0
                                             ? static_cast<uint32_t>(dirLightIndex)
                                             : 0xFFFFFFFFu;
+    var["PerFrame"]["gUseNeuralIndirect"] = mode == Mode::NeuralIndirect ? 1u : 0u;
+    var["PerFrame"]["gNeuralIndirectScale"] = neuralIndirectScale;
+    var["PerFrame"]["gSurfaceOffset"] = surfaceOffset;
+
+    if (mode == Mode::NeuralIndirect)
+        pNeuralModel->bindShaderData(var);
 
     // Bind accumulation UAV.
     var["gAccum"] = mpAccum;
 
     // Dispatch rays.
-    mpScene->raytrace(pRenderContext, mpProgram.get(), mpVars, uint3(w, h, 1));
+    mpScene->raytrace(pRenderContext, pProgram.get(), pVars, uint3(w, h, 1));
 
     // Blit accumulated result into the target FBO.
     pRenderContext->blit(mpAccum->getSRV(), pTargetFbo->getRenderTargetView(0));

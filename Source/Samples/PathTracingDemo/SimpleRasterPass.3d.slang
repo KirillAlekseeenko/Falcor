@@ -1,6 +1,11 @@
 import Scene.Raster;
 import Utils.Sampling.TinyUniformSampleGenerator;
 import Rendering.Lights.LightHelpers;
+#include "Utils/Math/MathConstants.slangh"
+
+#if USE_NEURAL_INDIRECT
+import Rendering.NeuralIrradianceModel;
+#endif
 
 static const uint kCascadeCount = 4;
 
@@ -11,6 +16,9 @@ cbuffer CommonParameters
     float2   gTexelSize;                       // 1 / shadowMapSize, used for PCF offsets
     int      globalLightIndex;
     int      gShadowsEnabled;
+    int      gNeuralIndirectEnabled;
+    float    gNeuralIndirectScale;
+    float    gSurfaceOffset;
 };
 
 Texture2DArray<float> gShadowDepth;    // D32Float array, one slice per cascade
@@ -89,6 +97,15 @@ float4 psMain(VSOut vsOut, uint triangleIndex: SV_PrimitiveID) : SV_TARGET
         evalLightApproximate(sd.posW, lightData, ls);
         color += mi.eval(sd, ls.dir, sg) * ls.Li * visibility;
     }
+
+#if USE_NEURAL_INDIRECT
+    if (gNeuralIndirectEnabled != 0)
+    {
+        let bsdfInfo = mi.getProperties(sd);
+        float3 irradiance = max(neuralIrradianceEvaluate(sd.posW + sd.frame.N * gSurfaceOffset, sd.frame.N), float3(0.f));
+        color += bsdfInfo.diffuseReflectionAlbedo * irradiance * float(M_1_PI) * gNeuralIndirectScale;
+    }
+#endif
 
     //let bsdfInfo = mi.getProperties(sd);
     //color = bsdfInfo.diffuseReflectionAlbedo;

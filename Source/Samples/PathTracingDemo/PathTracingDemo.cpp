@@ -27,7 +27,10 @@
  **************************************************************************/
 #include "PathTracingDemo.h"
 
+#include "Core/Platform/OS.h"
 #include "Utils/UI/TextRenderer.h"
+
+#include <algorithm>
 
 FALCOR_EXPORT_D3D12_AGILITY_SDK
 
@@ -60,28 +63,22 @@ void PathTracingDemo::loadScene(const std::string& scenePath, Fbo* displayFbo)
     mpCamera->setDepthRange(nearZ, farZ);
     mpCamera->setAspectRatio((float)displayFbo->getWidth() / (float)displayFbo->getHeight());
 
-    // Get shader modules and type conformances for types used by the scene.
-    // These need to be set on the program in order to use Falcor's material system.
-    auto shaderModules    = mpScene->getShaderModules();
-    auto typeConformances = mpScene->getTypeConformances();
-    auto defines          = mpScene->getSceneDefines();
-
     // ---- Lighting raster pass -------------------------------------------
-    ProgramDesc rasterProgDesc;
-    rasterProgDesc.addShaderModules(shaderModules);
-    rasterProgDesc.setCompilerFlags(SlangCompilerFlags::GenerateDebugInfo);
-    rasterProgDesc.addShaderLibrary("Samples/PathTracingDemo/SimpleRasterPass.3d.slang")
-        .vsEntry("vsMain")
-        .psEntry("psMain");
-    rasterProgDesc.addTypeConformances(typeConformances);
-
-    mpRasterPass = RasterPass::create(getDevice(), rasterProgDesc, defines);
+    createRasterPasses();
 
     // ---- Cascaded shadow map --------------------------------------------
     mpShadowMapRenderer = std::make_unique<RenderShadowMap>(getDevice(), mpScene);
 
     // ---- Diffuse path tracer --------------------------------------------
     mpDiffusePT = std::make_unique<DiffusePathTracer>(getDevice(), mpScene);
+    mSurfaceOffset = computeSurfaceOffset();
+
+    if (mNeuralModelPath.empty())
+        mNeuralModelPath = getProjectDirectory() / "NeuralLightGridLearning" / "checkpoints" / "tiny_irradiance_mlp.falcor-mlp.bin";
+    if (std::filesystem::exists(mNeuralModelPath))
+        loadNeuralModel(mNeuralModelPath);
+    else
+        mNeuralModelStatus = fmt::format("No neural model loaded. Default path not found: {}", mNeuralModelPath.string());
 
     // ---- PCF comparison sampler -----------------------------------------
     Sampler::Desc sDesc;
@@ -97,6 +94,67 @@ void PathTracingDemo::loadScene(const std::string& scenePath, Fbo* displayFbo)
     bsDesc.setFilterMode(TextureFilteringMode::Linear, TextureFilteringMode::Linear, TextureFilteringMode::Linear)
           .setAddressingMode(TextureAddressingMode::Clamp, TextureAddressingMode::Clamp, TextureAddressingMode::Clamp);
     mpBrightnessSampler = getDevice()->createSampler(bsDesc);
+}
+
+void PathTracingDemo::createRasterPasses()
+{
+    if (!mpScene)
+        return;
+
+    ProgramDesc rasterProgDesc;
+    rasterProgDesc.addShaderModules(mpScene->getShaderModules());
+    rasterProgDesc.setCompilerFlags(SlangCompilerFlags::GenerateDebugInfo);
+    rasterProgDesc.addShaderLibrary("Samples/PathTracingDemo/SimpleRasterPass.3d.slang")
+        .vsEntry("vsMain")
+        .psEntry("psMain");
+    rasterProgDesc.addTypeConformances(mpScene->getTypeConformances());
+
+    DefineList directDefines = mpScene->getSceneDefines();
+    directDefines.add("USE_NEURAL_INDIRECT", "0");
+    mpRasterPass = RasterPass::create(getDevice(), rasterProgDesc, directDefines);
+
+    DefineList neuralDefines = mpScene->getSceneDefines();
+    neuralDefines.add("USE_NEURAL_INDIRECT", "1");
+    mpNeuralRasterPass = RasterPass::create(getDevice(), rasterProgDesc, neuralDefines);
+
+    if (mpHdrFbo)
+    {
+        mpRasterPass->getState()->setFbo(mpHdrFbo);
+        mpNeuralRasterPass->getState()->setFbo(mpHdrFbo);
+    }
+}
+
+void PathTracingDemo::loadNeuralModel(const std::filesystem::path& path)
+{
+    try
+    {
+        auto pModel = std::make_unique<NeuralIrradianceModel>(getDevice());
+        pModel->loadFromFile(path);
+        mpNeuralModel = std::move(pModel);
+        mNeuralModelPath = path;
+        mNeuralModelStatus = fmt::format("Loaded neural model: {}", path.string());
+        if (mpDiffusePT)
+            mpDiffusePT->reset();
+    }
+    catch (const std::exception& e)
+    {
+        mpNeuralModel.reset();
+        mNeuralModelStatus = fmt::format("Failed to load neural model '{}': {}", path.string(), e.what());
+        logError("{}", mNeuralModelStatus);
+    }
+}
+
+bool PathTracingDemo::isNeuralModelLoaded() const
+{
+    return mpNeuralModel && mpNeuralModel->isLoaded();
+}
+
+float PathTracingDemo::computeSurfaceOffset() const
+{
+    if (!mpScene)
+        return 1e-3f;
+
+    return std::max(1e-4f, mpScene->getSceneBounds().radius() * 1e-5f);
 }
 
 void PathTracingDemo::onLoad(RenderContext* pRenderContext)
@@ -144,6 +202,8 @@ void PathTracingDemo::onResize(uint32_t width, uint32_t height)
         mpHdrFbo->attachDepthStencilTarget(pDepthTex);
 
         mpRasterPass->getState()->setFbo(mpHdrFbo);
+        if (mpNeuralRasterPass)
+            mpNeuralRasterPass->getState()->setFbo(mpHdrFbo);
     }
 
     if (mpDiffusePT)
@@ -193,11 +253,24 @@ void PathTracingDemo::onFrameRender(RenderContext* pRenderContext, const ref<Fbo
     if (is_set(updates, IScene::UpdateFlags::RecompileNeeded))
         FALCOR_THROW("This sample does not support scene changes that require shader recompilation.");
 
-    if (mUsePathTracer)
+    const bool neuralModelLoaded = isNeuralModelLoaded();
+    const bool useReferencePathTracer = mRenderMode == RenderMode::ReferencePathTracer;
+    const bool useNeuralRayTracing = mRenderMode == RenderMode::NeuralRayTracing && neuralModelLoaded;
+    const bool usePathTracer = useReferencePathTracer || useNeuralRayTracing || mRenderMode == RenderMode::NeuralRayTracing;
+
+    if (usePathTracer)
     {
         // ---- Path-traced GI -------------------------------------------------
         // Render into the intermediate HDR FBO; brightness scale pass reads from it.
-        mpDiffusePT->render(pRenderContext, mpHdrFbo, dirLightIndex);
+        mpDiffusePT->render(
+            pRenderContext,
+            mpHdrFbo,
+            dirLightIndex,
+            useNeuralRayTracing ? DiffusePathTracer::Mode::NeuralIndirect : DiffusePathTracer::Mode::Reference,
+            neuralModelLoaded ? mpNeuralModel.get() : nullptr,
+            mNeuralIndirectScale,
+            mSurfaceOffset
+        );
     }
     else
     {
@@ -212,14 +285,17 @@ void PathTracingDemo::onFrameRender(RenderContext* pRenderContext, const ref<Fbo
         pRenderContext->clearFbo(mpHdrFbo.get(), clearColor, 1.0f, 0, FboAttachmentType::All);
 
         // 3c. Bind shadow map array and cascade data
-        const auto& pReflection = mpRasterPass->getProgram()->getReflector()->getDefaultParameterBlock();
+        const bool useNeuralRaster = mRenderMode == RenderMode::RasterNeuralIndirect && neuralModelLoaded;
+        ref<RasterPass> pActiveRasterPass = useNeuralRaster ? mpNeuralRasterPass : mpRasterPass;
+
+        const auto& pReflection = pActiveRasterPass->getProgram()->getReflector()->getDefaultParameterBlock();
         auto shadowMapLoc    = pReflection->getResourceBinding("gShadowDepth");
         auto shadowSamplerLoc = pReflection->getResourceBinding("gShadowSampler");
 
-        mpRasterPass->getVars()->setSrv(shadowMapLoc, mpShadowMapRenderer->getShadowMapArray()->getSRV());
-        mpRasterPass->getVars()->setSampler(shadowSamplerLoc, mpShadowSampler);
+        pActiveRasterPass->getVars()->setSrv(shadowMapLoc, mpShadowMapRenderer->getShadowMapArray()->getSRV());
+        pActiveRasterPass->getVars()->setSampler(shadowSamplerLoc, mpShadowSampler);
 
-        auto var = mpRasterPass->getVars()->getRootVar();
+        auto var = pActiveRasterPass->getVars()->getRootVar();
         const auto& cascades = mpShadowMapRenderer->getCascades();
         for (uint32_t i = 0; i < RenderShadowMap::kCascadeCount; i++)
         {
@@ -231,9 +307,15 @@ void PathTracingDemo::onFrameRender(RenderContext* pRenderContext, const ref<Fbo
         var["CommonParameters"]["gTexelSize"]        = float2(kTexelSize, kTexelSize);
         var["CommonParameters"]["globalLightIndex"]  = dirLightIndex;
         var["CommonParameters"]["gShadowsEnabled"]   = mShadowsEnabled ? 1 : 0;
+        var["CommonParameters"]["gNeuralIndirectEnabled"] = useNeuralRaster ? 1 : 0;
+        var["CommonParameters"]["gNeuralIndirectScale"] = mNeuralIndirectScale;
+        var["CommonParameters"]["gSurfaceOffset"] = mSurfaceOffset;
+
+        if (useNeuralRaster)
+            mpNeuralModel->bindShaderData(var);
 
         // 3d. Lighting raster pass
-        mpScene->rasterize(pRenderContext, mpRasterPass->getState().get(), mpRasterPass->getVars().get());
+        mpScene->rasterize(pRenderContext, pActiveRasterPass->getState().get(), pActiveRasterPass->getVars().get());
     }
 
     // ---- Brightness scale pass (HDR → display) --------------------------
@@ -247,14 +329,49 @@ void PathTracingDemo::onFrameRender(RenderContext* pRenderContext, const ref<Fbo
 
 void PathTracingDemo::onGuiRender(Gui* pGui)
 {
-    Gui::Window w(pGui, "Falcor", {250, 200});
+    Gui::Window w(pGui, "Falcor", {420, 280});
     renderGlobalUI(pGui);
 
-    if (w.checkbox("Path Tracing", mUsePathTracer) && !mUsePathTracer)
-        mpDiffusePT->reset(); // clear accumulation when switching back in
+    static const Gui::DropdownList kRenderModes = {
+        {uint32_t(RenderMode::RasterDirect), "Raster direct"},
+        {uint32_t(RenderMode::RasterNeuralIndirect), "Raster direct + neural GI"},
+        {uint32_t(RenderMode::ReferencePathTracer), "Reference path tracer"},
+        {uint32_t(RenderMode::NeuralRayTracing), "RT direct + neural GI"},
+    };
 
-    if (!mUsePathTracer)
+    uint32_t renderMode = uint32_t(mRenderMode);
+    if (w.dropdown("Render Mode", kRenderModes, renderMode))
+    {
+        mRenderMode = RenderMode(renderMode);
+        if (mpDiffusePT)
+            mpDiffusePT->reset();
+    }
+
+    if (mRenderMode == RenderMode::RasterDirect || mRenderMode == RenderMode::RasterNeuralIndirect)
         w.checkbox("Shadows", mShadowsEnabled);
+
+    w.separator();
+    w.text("Neural Irradiance");
+    w.text(mNeuralModelPath.empty() ? "<none>" : mNeuralModelPath.string());
+    if (w.button("Load Model"))
+    {
+        static const FileDialogFilterVec kModelFilters = {{ "bin", "Falcor MLP model" }};
+        std::filesystem::path path = mNeuralModelPath;
+        if (openFileDialog(kModelFilters, path))
+            loadNeuralModel(path);
+    }
+
+    if (w.button("Reload Model", true) && !mNeuralModelPath.empty())
+        loadNeuralModel(mNeuralModelPath);
+
+    if (w.var("GI Scale", mNeuralIndirectScale, 0.f, 10.f) && mpDiffusePT)
+        mpDiffusePT->reset();
+
+    w.var("Surface Offset", mSurfaceOffset, 1e-6f, 1.f);
+    w.text(mNeuralModelStatus);
+
+    if ((mRenderMode == RenderMode::RasterNeuralIndirect || mRenderMode == RenderMode::NeuralRayTracing) && !isNeuralModelLoaded())
+        w.text("Neural mode selected, but no model is loaded.");
 }
 
 bool PathTracingDemo::onKeyEvent(const KeyboardEvent& keyEvent)
@@ -278,7 +395,12 @@ bool PathTracingDemo::onMouseEvent(const MouseEvent& mouseEvent)
 
 void PathTracingDemo::onHotReload(HotReloadFlags reloaded)
 {
-    //
+    if (is_set(reloaded, HotReloadFlags::Program))
+    {
+        createRasterPasses();
+        if (mpDiffusePT)
+            mpDiffusePT->recreatePrograms();
+    }
 }
 
 

@@ -2,6 +2,11 @@ import Scene.Raytracing;
 import Utils.Sampling.TinyUniformSampleGenerator;
 import Utils.Math.MathHelpers;
 import Rendering.Lights.LightHelpers;
+#include "Utils/Math/MathConstants.slangh"
+
+#if USE_NEURAL_INDIRECT
+import Rendering.NeuralIrradianceModel;
+#endif
 
 // ---- Constants --------------------------------------------------------------
 
@@ -17,6 +22,9 @@ cbuffer PerFrame
     uint2  gFrameDim;
     uint   gFrameIndex;
     uint   gDirLightIndex; ///< Index of the directional light, or 0xFFFFFFFF
+    uint   gUseNeuralIndirect;
+    float  gNeuralIndirectScale;
+    float  gSurfaceOffset;
 };
 
 // ---- Payload types ----------------------------------------------------------
@@ -132,7 +140,7 @@ void primaryClosestHit(inout PathPayload p, BuiltInTriangleIntersectionAttribute
 
         //if (dot(sd.frame.N, ls.dir) > 0.f)
         {
-            float3 shadowOrigin = sd.posW + sd.frame.N * 1e-3f;
+            float3 shadowOrigin = sd.posW + sd.frame.N * gSurfaceOffset;
             if (traceShadowRay(shadowOrigin, ls.dir, ls.distance))
                 direct += mi.eval(sd, ls.dir, sg) * ls.Li;
         }
@@ -165,6 +173,31 @@ void rayGen()
 
     RayDesc ray = gScene.camera.computeRayPinhole(pixel, gFrameDim).toRayDesc();
 
+#if USE_NEURAL_INDIRECT
+    if (gUseNeuralIndirect != 0u)
+    {
+        PathPayload p;
+        p.bounce     = 0u;
+        p.terminated = false;
+
+        TraceRay(gScene.rtAccel, RAY_FLAG_NONE, 0xFF,
+                 0, kRayTypeCount, 0,
+                 ray, p);
+
+        radiance = p.radiance;
+        if (!p.terminated)
+        {
+            float3 irradiance = max(neuralIrradianceEvaluate(p.posW + p.normalW * gSurfaceOffset, p.normalW), float3(0.f));
+            radiance += p.albedo * irradiance * float(M_1_PI) * gNeuralIndirectScale;
+        }
+
+        float3 prev   = gAccum[pixel].rgb;
+        float  weight = 1.f / float(gFrameIndex + 1u);
+        gAccum[pixel] = float4(lerp(prev, radiance, weight), 1.f);
+        return;
+    }
+#endif
+
     [loop]
     for (uint bounce = 0; bounce <= kMaxBounces; bounce++)
     {
@@ -183,7 +216,7 @@ void rayGen()
         throughput *= p.albedo;
 
         // Advance ray
-        ray.Origin    = p.posW + p.normalW * 1e-3f;
+        ray.Origin    = p.posW + p.normalW * gSurfaceOffset;
         ray.Direction = p.nextDir;
         ray.TMin      = 0.f;
         ray.TMax      = 1e30f;

@@ -30,6 +30,7 @@
 #include "Core/SampleApp.h"
 #include "Core/Pass/RasterPass.h"
 #include "Core/Pass/FullScreenPass.h"
+#include "Rendering/NeuralIrradianceModel.h"
 #include "RenderShadowMap.h"
 #include "DiffusePathTracer.h"
 
@@ -52,22 +53,41 @@ public:
     void onHotReload(HotReloadFlags reloaded) override;
 
 private:
+    enum class RenderMode : uint32_t
+    {
+        RasterDirect = 0,
+        RasterNeuralIndirect = 1,
+        ReferencePathTracer = 2,
+        NeuralRayTracing = 3,
+    };
+
     float3 getFirstDirectionalLightDir(int& dirLightIndex) const;
+    void createRasterPasses();
+    void loadNeuralModel(const std::filesystem::path& path);
+    bool isNeuralModelLoaded() const;
+    float computeSurfaceOffset() const;
 
 private:
     ref<Scene>  mpScene;
     ref<Camera> mpCamera;
 
     ref<RasterPass> mpRasterPass;
+    ref<RasterPass> mpNeuralRasterPass;
 
     std::unique_ptr<RenderShadowMap>   mpShadowMapRenderer;
     ref<Sampler>                       mpShadowSampler;     ///< Comparison sampler for PCF
     bool                               mShadowsEnabled = true;
 
     std::unique_ptr<DiffusePathTracer> mpDiffusePT;
-    bool                               mUsePathTracer = false;
+    RenderMode                         mRenderMode = RenderMode::RasterDirect;
 
     ref<FullScreenPass> mpBrightnessScalePass;
     ref<Sampler>        mpBrightnessSampler;
     ref<Fbo>            mpHdrFbo;             ///< Intermediate HDR render target
+
+    std::unique_ptr<NeuralIrradianceModel> mpNeuralModel;
+    std::filesystem::path                  mNeuralModelPath;
+    std::string                            mNeuralModelStatus;
+    float                                  mNeuralIndirectScale = 1.f;
+    float                                  mSurfaceOffset = 1e-3f;
 };
